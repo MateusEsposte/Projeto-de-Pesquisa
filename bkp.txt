@@ -1,0 +1,499 @@
+views.py:
+
+@csrf_exempt
+def create_object_property_view(request):
+    global onto
+    if onto is None:
+        return JsonResponse({'status':'error','message':'Nenhuma ontologia carregada'}, status=400)
+
+    if request.method != 'POST':
+        return JsonResponse({'status':'error','message':'Método não permitido'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        name = data.get('name')
+        domain = data.get('domain', [])
+        range = data.get('range', [])
+        characteristics = data.get('characteristics', [])
+        inverse_of = data.get('inverse_of')
+        subproperties = data.get('subproperty_of', [])
+        equivalents = data.get('equivalents', [])
+        disjoints = data.get('disjoints', [])
+
+        if not name:
+            return JsonResponse({'status':'error','message':'Nome é obrigatório'}, status=400)
+
+        with onto:
+            prop = "Danilo"
+            prop = types.new_class(prop, (ObjectProperty,))
+            
+            # Define domínio e range
+            prop.domain = [onto.search_one(iri=f"*{cls}") for cls in domain]
+            prop.range = [onto.search_one(iri=f"*{cls}") for cls in range]
+            
+            # Adiciona características
+            for char in characteristics:
+                if char == 'Functional':
+                    prop.is_a.append(FunctionalProperty)
+                elif char == 'InverseFunctional':
+                    prop.is_a.append(InverseFunctionalProperty)
+                # Adicionar outras características...
+
+            # Relacionamentos
+            if inverse_of:
+                inverse_prop = onto.search_one(iri=f"*{inverse_of}")
+                if inverse_prop:
+                    prop.inverse_property = inverse_prop
+
+            # Subpropriedades
+            for sub in subproperties:
+                sub_prop = onto.search_one(iri=f"*{sub}")
+                if sub_prop:
+                    prop.is_a.append(sub_prop)
+
+            onto.save(file=onto_path)  # <---------
+
+        return JsonResponse({
+            'status':'success',
+            'object_property': serialize_property(prop),
+            'object_properties': [serialize_property(p) for p in onto.object_properties()]
+        })
+
+    except Exception as e:
+        return JsonResponse({'status':'error','message':str(e)}, status=500)
+
+
+@csrf_exempt
+def create_data_property_view(request):
+    global onto
+    if onto is None:
+        return JsonResponse({'status':'error','message':'Nenhuma ontologia carregada'}, status=400)
+
+    if request.method != 'POST':
+        return JsonResponse({'status':'error','message':'Método não permitido'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        name = data.get('name')
+        domain = data.get('domain', [])
+        range = data.get('range', 'xsd:string')
+        characteristics = data.get('characteristics', [])
+
+        if not name or not range:
+            return JsonResponse({'status':'error','message':'Nome e range são obrigatórios'}, status=400)
+
+        with onto:
+            # Cria a propriedade
+            prop = types.new_class(name, (DataProperty,))
+            
+            # Domínio
+            prop.domain = [onto.search_one(iri=f"*{cls}") for cls in domain]
+            
+            # Range (tipos de dados)
+            xsd = onto.get_namespace('http://www.w3.org/2001/XMLSchema#')
+            prop.range = [getattr(xsd, range.split(':')[-1])]
+            
+            # Características funcionais
+            if 'Functional' in characteristics:
+                prop.is_a.append(FunctionalProperty)
+
+            onto.save(file=onto_path)
+
+        return JsonResponse({
+            'status':'success',
+            'data_property': serialize_property(prop),
+            'data_properties': [serialize_property(p) for p in onto.data_properties()]
+        })
+
+    except Exception as e:
+        return JsonResponse({'status':'error','message':str(e)}, status=500)
+
+
+def serialize_property(prop):
+    def get_class_name(entity):
+        if isinstance(entity, type) and issubclass(entity, Thing):
+            return entity.name
+        return str(entity)
+
+    try:
+        # Domínio simplificado
+        domain = [get_class_name(e) for e in getattr(prop, 'domain', [])]
+        
+        # Range diferenciado por tipo de propriedade
+        if isinstance(prop, DataPropertyClass):
+            range_value = [r.iri if hasattr(r, 'iri') else str(r) for r in prop.range]
+        else:
+            range_value = [get_class_name(e) for e in getattr(prop, 'range', [])]
+
+        # Características
+        is_functional = isinstance(prop, FunctionalProperty)
+        
+        return {
+            'name': prop.name,
+            'iri': prop.iri,
+            'domain': domain,
+            'range': range_value,
+            'is_functional': is_functional,
+            'characteristics': {
+                'functional': is_functional,
+                'inverse_functional': isinstance(prop, InverseFunctionalProperty),
+                # Adicione outras características conforme necessário
+            }
+        }
+
+    except Exception as e:
+        return {'name': prop.name, 'error': str(e)}
+______________________________________________________________________________________
+
+OntologyUpload.js:
+
+  const handlePropertyChange = (index, field, value) => {
+    const newProperties = [...individualProperties];
+    newProperties[index][field] = value;
+    setIndividualProperties(newProperties);
+  };
+  
+  const removeProperty = (index) => {
+    setIndividualProperties(individualProperties.filter((_, i) => i !== index));
+  };
+
+  const handleCreateDataProperty = async () => {
+    if (!newDataPropName) {
+      alert('Informe o nome da DataProperty');
+      return;
+    }
+  
+    if (!dataDomain.length) {
+      alert('Selecione ao menos um domínio para a DataProperty');
+      return;
+    }
+  
+    if (!dataRange) {
+      alert('Selecione o Range para a DataProperty');
+      return;
+    }
+  
+    try {
+      const res = await axios.post('http://localhost:8000/create-data-property/', {
+        name: newDataPropName,
+        domain: dataDomain,
+        range: dataRange,
+        characteristics: dataCharacteristics
+      });
+  
+      if (res.data.status === 'success') {
+        setOntologyData(prev => ({
+          ...prev,
+          data_properties: res.data.data_properties // Novo formato de resposta
+        }));
+        setShowCreateDataPropForm(false);
+        setNewDataPropName('');
+        setDataDomain([]);
+        setDataRange('');
+        setDataCharacteristics([]);
+        setMessage(`✅ ${res.data.message}`);
+        setTimeout(() => setMessage(''), 3000);
+      } else {
+        alert(res.data.message);
+      }
+    } catch (e) {
+      const errorMsg = e.response?.data?.message;
+      if (errorMsg?.includes('domínio')) {
+        setMessage('❌ Domínio inválido ou não encontrado');
+      } else {
+        setMessage(`❌ Erro: ${errorMsg || e.message}`);
+      }
+    }
+  };
+
+
+                <button
+                  onClick={() =>
+                    setShowCreateObjPropForm(!showCreateObjPropForm)
+                  }
+                >
+                  + Nova ObjectProperty
+                </button>
+
+                {showCreateObjPropForm && (
+                  <div className="create-prop-form">
+                    <input
+                      placeholder="Nome"
+                      value={newObjPropName}
+                      onChange={e => setNewObjPropName(e.target.value)}
+                    />
+
+                    <h5>Domínio</h5>
+                    <select
+                      multiple
+                      value={objDomain}
+                      onChange={e =>
+                        setObjDomain(
+                          Array.from(e.target.selectedOptions, opt => opt.value)
+                        )
+                      }
+                    >
+                      {flattenClasses(ontologyData.classes).map(c => (
+                        <option key={c.name} value={c.name}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <h5>Range</h5>
+                    <select
+                      multiple
+                      value={objRange}
+                      onChange={e =>
+                        setObjRange(
+                          Array.from(e.target.selectedOptions, opt => opt.value)
+                        )
+                      }
+                    >
+                      {flattenClasses(ontologyData.classes).map(c => (
+                        <option key={c.name} value={c.name}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <h5>Características</h5>
+                    <div className="checkbox-group">
+                      {[
+                        'Functional',
+                        'InverseFunctional',
+                        'Transitive',
+                        'Symmetric',
+                        'Asymmetric',
+                        'Reflexive',
+                        'Irreflexive',
+                      ].map(char => (
+                        <label key={char}>
+                          <input
+                            type="checkbox"
+                            value={char}
+                            checked={objCharacteristics.includes(char)}
+                            onChange={e => {
+                              if (e.target.checked)
+                                setObjCharacteristics(prev => [...prev, char]);
+                              else
+                                setObjCharacteristics(prev =>
+                                  prev.filter(c => c !== char)
+                                );
+                            }}
+                          />
+                          {char}
+                        </label>
+                      ))}
+                    </div>
+
+                    <h5>Inverse Of</h5>
+                      <select
+                        value={objInverseOf}
+                        onChange={e => setObjInverseOf(e.target.value)}
+                      >
+                        <option value="">Nenhum</option>
+                        {ontologyData.object_properties?.map(p => (
+                          <option key={p.name} value={p.name}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+
+                    <h5>SubProperty Of</h5>
+                    <select
+                      multiple
+                      value={objSubProperties}
+                      onChange={e =>
+                        setObjSubProperties(
+                          Array.from(e.target.selectedOptions, opt => opt.value)
+                        )
+                      }
+                    >
+                      {ontologyData.object_properties?.map(p => (
+                        <option key={p.name} value={p.name}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <h5>Equivalent To</h5>
+                    <select
+                      multiple
+                      value={objEquivalents}
+                      onChange={e =>
+                        setObjEquivalents(
+                          Array.from(e.target.selectedOptions, opt => opt.value)
+                        )
+                      }
+                    >
+                      {ontologyData.object_properties?.map(p => (
+                        <option key={p.name} value={p.name}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <h5>Disjoint With</h5>
+                    <select
+                      multiple
+                      value={objDisjoints}
+                      onChange={e =>
+                        setObjDisjoints(
+                          Array.from(e.target.selectedOptions, opt => opt.value)
+                        )
+                      }
+                    >
+                      {ontologyData.object_properties?.map(p => (
+                        <option key={p.name} value={p.name}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <button onClick={handleCreateObjectProperty}>Criar</button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {activeTab === 'data_properties' && (
+              <>
+                <button onClick={() => setShowCreateDataPropForm(!showCreateDataPropForm)}>+ Nova DataProperty</button>
+                {showCreateDataPropForm && (
+                  <div className="create-prop-form">
+                    <input
+                      placeholder="Nome"
+                      value={newDataPropName}
+                      onChange={e => setNewDataPropName(e.target.value)}
+                    />
+                    <select
+                      multiple
+                      value={dataDomain}
+                      onChange={e => setDataDomain(Array.from(e.target.selectedOptions, opt => opt.value))} // Correção na sintaxe
+                    >
+                      {flattenClasses(ontologyData.classes).map(c => (
+                        <option key={c.name} value={c.name}>{c.name}</option>
+                      ))}
+                    </select>
+                    
+                    <select // Novo seletor de tipos XSD
+                      value={dataRange}
+                      onChange={e => setDataRange(e.target.value)}
+                      className="xsd-select"
+                    >
+                      <option value="">Selecione o tipo</option>
+                      <option value="xsd:string">String</option>
+                      <option value="xsd:integer">Integer</option>
+                      <option value="xsd:float">Float</option>
+                      <option value="xsd:boolean">Boolean</option>
+                      <option value="xsd:date">Date</option>
+                    </select>
+
+                    <div className="checkbox-group">
+                      {['Functional'].map(char => (
+                        <label key={char}>
+                          <input
+                            type="checkbox"
+                            checked={dataCharacteristics.includes(char)}
+                            onChange={e => {
+                              if (e.target.checked) {
+                                setDataCharacteristics(prev => [...prev, char]);
+                              } else {
+                                setDataCharacteristics(prev => prev.filter(c => c !== char));
+                              }
+                            }}
+                          />
+                          {char}
+                        </label>
+                      ))}
+                    </div>
+
+                    <button onClick={handleCreateDataProperty}>Criar</button>
+                  </div>
+                )}
+
+______________________________________________________________________________________________________
+
+URLS.py:
+
+    create_object_property_view,
+    create_data_property_view,
+
+    path('create-data-property/', create_data_property_view, name='create_data_property'),
+    path('create-object-property/', create_object_property_view, name='create-object-property'),
+
+_______________________________________________________________________________________________________
+
+Testar:
+
+
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse
+from owlready2 import ObjectProperty, ObjectPropertyClass, get_ontology
+import traceback
+import json
+import types
+import os
+
+@csrf_exempt
+def create_object_property_view(request):
+    global onto, onto_path
+
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Apenas método POST permitido'}, status=405)
+
+    if onto is None or onto_path is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada no sistema'}, status=400)
+
+    try:
+        # Check if we're receiving form data or JSON
+        if request.content_type == 'application/json':
+            data = json.loads(request.body)
+            property_name = data.get('property_name')
+            domain_class = data.get('domain')
+            range_class = data.get('range')
+        else:
+            property_name = request.POST.get('property_name')
+            domain_class = request.POST.get('domain')
+            range_class = request.POST.get('range')
+        
+        # Validate required fields
+        if not property_name:
+            return JsonResponse({'status': 'error', 'message': 'Campo obrigatório: property_name'}, status=400)
+        if not domain_class:
+            return JsonResponse({'status': 'error', 'message': 'Campo obrigatório: domain'}, status=400)
+        if not range_class:
+            return JsonResponse({'status': 'error', 'message': 'Campo obrigatório: range'}, status=400)
+
+        with onto:
+            # Criação dinâmica de uma nova ObjectProperty
+            NewProperty = types.new_class(property_name, (ObjectProperty,), kwds={'namespace': onto})
+
+            # Atribuição de domínio e range, se encontrados
+            dom_cls = onto[domain_class]
+            rng_cls = onto[range_class]
+
+            if dom_cls: NewProperty.domain = [dom_cls]
+            if rng_cls: NewProperty.range = [rng_cls]
+
+        # Salvar no arquivo original
+        onto.save(file=onto_path, format="rdfxml")
+
+        # Recarrega a ontologia modificada para refletir nas demais views
+        onto = get_ontology(onto_path).load()
+
+        created_prop = onto[property_name]
+        prop_data = serialize_property(created_prop)
+
+        return JsonResponse({
+            'status': 'success',
+            'message': f'ObjectProperty "{property_name}" criada com sucesso.',
+            'property': prop_data
+        })
+
+    except KeyError as e:
+        return JsonResponse({'status': 'error', 'message': f'Campo ausente: {str(e)}'}, status=400)
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)

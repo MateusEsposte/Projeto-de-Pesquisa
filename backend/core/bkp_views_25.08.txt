@@ -1,0 +1,2396 @@
+from django.shortcuts import render
+from django.http import JsonResponse, FileResponse
+from django.views.decorators.csrf import csrf_exempt
+from owlready2 import *
+from owlready2 import get_ontology
+from owlready2 import ObjectPropertyClass as ObjectProperty 
+from owlready2 import IRIS, World, default_world, sync_reasoner
+import os, traceback, json, types, re, logging
+logger = logging.getLogger(__name__)
+from owlready2 import (
+    Thing, types, ObjectPropertyClass, DataPropertyClass,
+    AnnotationPropertyClass, FunctionalProperty, 
+    TransitiveProperty, SymmetricProperty, 
+    Or, And, Not, Thing, ObjectPropertyClass, DataPropertyClass, 
+    AnnotationPropertyClass, DataProperty
+)
+
+
+# --- utilidades para resolver / sanitizar nomes/IRIs -------------------
+
+
+def sanitize_local_name(name: str) -> str:
+    """
+    Gera um identificador RDF/Python-safe a partir de uma string.
+    Ex.: "Poço Produção #1" -> "Poco_Producao_1"
+    Mantém só ASCII, letras/dígitos/underscore, e garante não começar com dígito.
+    """
+    if name is None:
+        return None
+    # normalize: remove acentos
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode("ASCII")
+    # keep letters/numbers/underscore
+    s = re.sub(r'[^0-9A-Za-z_]+', '_', s).strip('_')
+    # ensure it does not begin with digit
+    if re.match(r'^[0-9]', s):
+        s = f"n_{s}"
+    if not s:
+        s = "entity"
+    return s
+
+def resolve_individual(onto, identifier: str):
+    """
+    Tenta localizar um indivíduo pela (1) IRI exata, (2) local name no fim do IRI,
+    (3) label (rdfs:label), (4) atributo .name exato, (5) sanitizado.
+    Retorna o indivíduo Owlready2 ou None.
+    """
+    if identifier is None:
+        return None
+
+    # 1) se é IRI completo
+    if identifier.startswith("http://") or identifier.startswith("https://") or identifier.startswith("urn:"):
+        ind = onto.search_one(iri=identifier)
+        if ind:
+            return ind
+
+    # 2) busca por IRI terminado com local name (wildcard)
+    ind = onto.search_one(iri=f"*{identifier}")
+    if ind:
+        return ind
+
+    # 3) busca por rdfs:label
+    ind = onto.search_one(label=identifier)
+    if ind:
+        return ind
+
+    # 4) busca por name exato (o nome do atributo Python)
+    try:
+        ind = getattr(onto, identifier)
+        if ind:
+            return ind
+    except Exception:
+        pass
+
+    # 5) tentar buscar com sanitizado (caso tenha sido salvo com sanitized name)
+    sanitized = sanitize_local_name(identifier)
+    ind = onto.search_one(iri=f"*{sanitized}") or onto.search_one(label=sanitized) or (getattr(onto, sanitized, None))
+    if ind:
+        return ind
+
+    return None
+
+def individual_to_dict(ind):
+    """
+    Serializa indivíduo de forma mais robusta: name, iri, label (se houver), classes, properties...
+    """
+    def value_to_str(v):
+        # indivíduo:
+        try:
+            if hasattr(v, 'iri'):
+                # preferir label se existir
+                lab = v.label.first() if hasattr(v, 'label') and v.label else None
+                return {"type": "individual", "name": getattr(v, "name", None), "label": lab, "iri": str(v.iri)}
+        except Exception:
+            pass
+        # literal/primitive
+        try:
+            return {"type": "literal", "value": v.toPython() if hasattr(v, "toPython") else str(v)}
+        except Exception:
+            return {"type": "literal", "value": str(v)}
+
+    props = {}
+    for p in ind.get_properties():
+        try:
+            vals = getattr(ind, p.name)
+            if not isinstance(vals, list):
+                vals = [vals]
+            props[p.name] = [value_to_str(v) for v in vals]
+        except Exception:
+            props[p.name] = []
+    return {
+        "name": getattr(ind, "name", None),
+        "iri": str(getattr(ind, "iri", "")),
+        "label": ind.label.first() if ind.label else None,
+        "classes": [c.name for c in ind.is_a if hasattr(c, "name")],
+        "properties": props
+    }
+
+world = World()
+
+onto_path = ""
+onto = None
+
+def build_entity_hierarchy(entity):
+    def get_all_subclasses(entity):
+        subs = []
+        for sub in sorted(entity.subclasses(), key=lambda x: x.name or ""):
+            subs.append({
+                'name': sub.name,
+                'children': get_all_subclasses(sub)
+            })
+        return subs
+    return {
+        'name': entity.name,
+        'children': get_all_subclasses(entity)
+    }
+
+def serialize_entity(entity):
+    return {
+        'name': entity.name,
+        'iri': entity.iri,
+        'comment': entity.comment.first() if entity.comment else ''
+    }
+
+def serialize_individual(ind):
+    def process_value(value):
+        if hasattr(value, 'name'):
+            return value.name
+        elif isinstance(value, (Or, And, Not)):
+            return str(value)
+        return str(value)
+
+    properties_data = {}
+    for prop in ind.get_properties():
+        try:
+            values = getattr(ind, prop.name)
+            if not isinstance(values, list):
+                values = [values]
+            properties_data[prop.name] = [process_value(v) for v in values]
+        except AttributeError:
+            properties_data[prop.name] = []
+        except Exception:
+            properties_data[prop.name] = ["ErroAoAcessar"]
+    return {
+        'name': ind.name,
+        'type': [cls.name for cls in ind.is_a if hasattr(cls, 'name')],
+        'properties': properties_data
+    }
+
+
+def serialize_property(prop):
+    try:
+        from owlready2 import And, Or, FunctionalProperty, TransitiveProperty, SymmetricProperty, ObjectProperty
+
+        # Helper para extrair nomes de classes de expressões lógicas (And/Or)
+        def extract_classes(item):
+            if isinstance(item, (And, Or)):
+                return [extract_classes(c) for c in item.Classes]
+            elif hasattr(item, 'name'):
+                return item.name
+            else:
+                return str(item)
+
+        # Converter IRI para string e garantir valores padrão
+        prop_data = {
+            'name': getattr(prop, 'name', ''),
+            'iri': str(getattr(prop, 'iri', '')),
+            'domain': [],
+            'range': [],
+            'is_functional': False,
+            'is_transitive': False,
+            'is_symmetric': False,
+            'error': None
+        }
+
+        # Verificar se é uma propriedade de objeto
+        if not isinstance(prop, ObjectProperty):
+            prop_data['error'] = 'Tipo de propriedade não suportado'
+            return prop_data
+
+        # Processar domínio
+        domain = getattr(prop, 'domain', [])
+        if not isinstance(domain, list):
+            domain = [domain]
+        prop_data['domain'] = [extract_classes(item) for item in domain]
+
+        # Processar range
+        prop_range = getattr(prop, 'range', [])
+        if not isinstance(prop_range, list):
+            prop_range = [prop_range]
+        prop_data['range'] = [extract_classes(item) for item in prop_range]
+
+        # Verificar características especiais
+        prop_data['is_functional'] = isinstance(prop, FunctionalProperty)
+        prop_data['is_transitive'] = isinstance(prop, TransitiveProperty)
+        prop_data['is_symmetric'] = isinstance(prop, SymmetricProperty)
+
+        return prop_data
+
+    except Exception as e:
+        # Log detalhado para debug
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Erro serializando propriedade {prop}: {str(e)}", exc_info=True)
+        
+        return {
+            'name': getattr(prop, 'name', 'ErroDesconhecido'),
+            'error': str(e)
+        }
+    
+
+@csrf_exempt
+def load_ontology_view(request):
+    global world, onto, onto_path
+    if request.method == 'POST':
+        if 'ontology_file' not in request.FILES:
+            return JsonResponse({'status': 'error', 'message': 'Nenhum arquivo enviado'}, status=400)
+        try:
+            logger.info(f"[LOAD] onto id: {id(onto)}, onto_path: {onto_path!r}")
+            file = request.FILES['ontology_file']
+            media_dir = settings.MEDIA_ROOT
+            os.makedirs(media_dir, exist_ok=True)
+            path = os.path.join(media_dir, file.name)
+            with open(path, 'wb+') as dest:
+                for chunk in file.chunks(): dest.write(chunk)
+
+            onto_path = path
+            onto = get_ontology(path).load()
+            sync_reasoner()
+
+            all_classes = list(onto.classes())
+            roots = [c for c in onto.classes() if Thing in c.is_a] or all_classes
+
+            datatypes = {rng.name for p in onto.data_properties() for rng in getattr(p, 'range', []) if hasattr(rng, 'name')}
+            datatypes |= {'xsd:string','xsd:integer','xsd:float','xsd:boolean','xsd:dateTime'}
+
+            data = {
+                'classes': [build_entity_hierarchy(c) for c in roots],
+                'classes_count': len(all_classes),
+                'object_properties': [serialize_property(p) for p in onto.object_properties()],
+                'data_properties': [serialize_property(p) for p in onto.data_properties()],
+                'annotation_properties': [serialize_property(p) for p in onto.annotation_properties()],
+                'individuals': [serialize_individual(i) for i in onto.individuals()],
+                'datatypes': list(datatypes)
+            }
+            return JsonResponse({'status':'success','message':'Ontologia carregada!','ontology':data})
+        except Exception as e:
+            traceback.print_exc()
+            return JsonResponse({'status':'error','message':str(e)}, status=400)
+    return JsonResponse({'status':'error','message':'Método não permitido'}, status=405)
+
+@csrf_exempt
+def create_class_view(request):
+    global onto
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            class_name = data.get('name')
+            parent_names = data.get('parents', [])
+            
+
+            if not class_name:
+                return JsonResponse({'status': 'error', 'message': 'Nome da classe é obrigatório'}, status=400)
+
+            with onto:
+                # Definindo classes-pai
+                if parent_names:
+                    parents = []
+                    for parent_name in parent_names:
+                        parent_cls = onto.search_one(iri="*" + parent_name)
+                        if not parent_cls:
+                            return JsonResponse({'status': 'error', 'message': f'Classe pai "{parent_name}" não encontrada'}, status=400)
+                        parents.append(parent_cls)
+                else:
+                    parents = [Thing]
+
+                # Criando a nova classe
+                NewClass = types.new_class(class_name, tuple(parents))
+
+            # Atualizar a árvore de classes
+            all_classes = list(onto.classes())
+            root_classes = [cls for cls in onto.classes() if Thing in cls.is_a]
+            if not root_classes:
+                root_classes = all_classes
+
+            ontology_data = {
+                'classes': [build_entity_hierarchy(cls) for cls in root_classes],
+                'classes_count': len(all_classes)
+            }
+
+            return JsonResponse({'status': 'success', 'message': 'Classe criada com sucesso', 'ontology': ontology_data})
+
+        except Exception as e:
+            traceback.print_exc()
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+    return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+
+@csrf_exempt
+def export_ontology_view(request):
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    try:
+        filename = request.GET.get('filename', 'ontology.owl')
+        if not filename.endswith('.owl'):
+            filename += '.owl'
+
+        export_path = os.path.join(settings.MEDIA_ROOT, filename)
+        onto.save(file=export_path, format="rdfxml")
+
+        return FileResponse(open(export_path, 'rb'), as_attachment=True, filename=filename)
+
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+    
+
+@csrf_exempt
+def create_annotation_property_view(request):
+    global onto
+    if onto is None: return JsonResponse({'status':'error','message':'Nenhuma ontologia carregada'},status=400)
+    if request.method!='POST': return JsonResponse({'status':'error','message':'Método não permitido'},status=405)
+    try:
+        data=json.loads(request.body)
+        name, domains = data.get('name'), data.get('domain',[])
+        if not name: return JsonResponse({'status':'error','message':'Nome é obrigatório'},status=400)
+        with onto:
+            New = types.new_class(name, (AnnotationPropertyClass,))
+            New.namespace = onto
+            if domains:
+                New.domain = [d for d in domains if d]
+
+            onto.save(file=onto_path, format="rdfxml")
+            onto = get_ontology(onto_path).load()
+        return JsonResponse({'status':'success','message':'AnnotationProperty criada','annotation_properties':[serialize_property(p) for p in onto.annotation_properties()]})
+    except Exception as e:
+        traceback.print_exc(); return JsonResponse({'status':'error','message':str(e)},status=500)
+
+@csrf_exempt
+def create_individual_view(request):
+    global onto
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+    try:
+        data = json.loads(request.body)
+        individual_name = data.get('name')
+        class_names = data.get('classes', [])
+        properties = data.get('properties', {})
+        annotations = data.get('annotations', {})
+        obj_props = data.get('object_properties', {})
+        description = data.get('description', {})
+        same_as = data.get('same_as', [])
+        different_from = data.get('different_from', [])
+
+        if not individual_name:
+            return JsonResponse({'status': 'error', 'message': 'Nome do indivíduo é obrigatório'}, status=400)
+        if not class_names:
+            return JsonResponse({'status': 'error', 'message': 'Pelo menos uma classe deve ser especificada'}, status=400)
+
+        with onto:
+            # instantiate classes
+            classes = []
+            for cls_name in class_names:
+                ontology_class = onto.search_one(iri=f"*{cls_name}") or onto.search_one(label=cls_name)
+                if not ontology_class:
+                    return JsonResponse({'status': 'error', 'message': f'Classe "{cls_name}" não encontrada'}, status=400)
+                classes.append(ontology_class)
+
+            # create individual
+            new_individual = classes[0](individual_name)
+            if len(classes) > 1:
+                new_individual.is_a.extend(classes[1:])
+
+            # data properties
+            for prop_name, values in properties.items():
+                prop = onto.search_one(iri=f"*{prop_name}") or onto.search_one(label=prop_name)
+                if not prop or not isinstance(prop, DataPropertyClass):
+                    continue
+                # Process values into Python native types instead of rdflib Literals
+                processed = []
+                for item in values:
+                    val = item.get('value')
+                    lang = item.get('lang')
+                    dt_uri = item.get('datatype')
+                    if val is None:
+                        continue
+                    # Convert to Python type based on datatype
+                    if dt_uri and dt_uri.startswith('xsd:'):
+                        t = dt_uri[4:]
+                        try:
+                            if t in ('integer', 'int'):
+                                py_val = int(val)
+                            elif t in ('float', 'double', 'decimal'):
+                                py_val = float(val)
+                            elif t in ('boolean',):
+                                py_val = val.lower() in ('true', '1')
+                            else:
+                                py_val = val
+                        except Exception:
+                            py_val = val
+                    else:
+                        py_val = val
+                    processed.append(py_val)
+                # Assign to the individual
+                if isinstance(prop, FunctionalProperty) and processed:
+                    setattr(new_individual, prop.name, processed[0])
+                else:
+                    for v in processed:
+                        getattr(new_individual, prop.name).append(v)
+
+            # object properties
+            for prop_name, targets in obj_props.items():
+                prop = onto.search_one(iri=f"*{prop_name}") or onto.search_one(label=prop_name)
+                if not prop or not isinstance(prop, ObjectPropertyClass):
+                    continue
+                for t in targets:
+                    target_ind = onto.search_one(iri=f"*{t}") or onto.search_one(label=t)
+                    if target_ind:
+                        getattr(new_individual, prop.name).append(target_ind)
+
+            # annotations
+            for anno_name, values in annotations.items():
+                prop = onto.search_one(iri=f"*{anno_name}") or onto.search_one(label=anno_name)
+                if not prop or not isinstance(prop, AnnotationPropertyClass):
+                    continue
+                for v in values:
+                    prop[new_individual].append(v)
+
+            # description, same_as, different_from
+            for extra in description.get('types', []):
+                cls = onto.search_one(iri=f"*{extra}") or onto.search_one(label=extra)
+                if cls:
+                    new_individual.is_a.append(cls)
+            for same in same_as:
+                other = onto.search_one(iri=f"*{same}") or onto.search_one(label=same)
+                if other:
+                    new_individual.same_as.append(other)
+            for diff in different_from:
+                other = onto.search_one(iri=f"*{diff}") or onto.search_one(label=diff)
+                if other:
+                    new_individual.different_from.append(other)
+
+            onto.save(file=onto_path, format="rdfxml")
+
+        return JsonResponse({
+            'status': 'success',
+            'message': 'Indivíduo criado!',
+            'ontology': {'individuals': [serialize_individual(i) for i in onto.individuals()]}
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
+@csrf_exempt
+def list_data_properties_view(request):
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    try:
+        data_properties = [
+            serialize_property(prop) for prop in onto.data_properties()
+        ]
+        return JsonResponse({'status': 'success', 'data_properties': data_properties})
+
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+@csrf_exempt
+def list_object_properties_view(request):
+    """
+    GET: retorna todas as ObjectProperties definidas na ontologia,
+         com domínio e range (se houver).
+    """
+    global onto
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    if request.method != 'GET':
+        return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+
+    try:
+        props = []
+        for prop in onto.object_properties():
+            # domínio e range podem ser listas vazias
+            domains = [cls.name for cls in getattr(prop, "domain", [])]
+            ranges  = [cls.name for cls in getattr(prop, "range",  [])]
+            props.append({
+                'name':       prop.name,
+                'iri':        prop.iri,
+                'label':      prop.label.first() or None,
+                'domain':     domains,
+                'range':      ranges,
+                'is_functional': isinstance(prop, ObjectPropertyClass) and prop.is_functional,
+            })
+
+        return JsonResponse({
+            'status':            'success',
+            'object_properties': props
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+@csrf_exempt
+def relationship_manager_view(request):
+    global onto
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        subject_name = data.get('subject')
+        object_property_name = data.get('object_property')
+        target_name = data.get('target')
+        action = data.get('action')
+        replace_with_name = data.get('replace_with')
+
+        if not subject_name or not object_property_name or not action:
+            return JsonResponse({'status': 'error', 'message': 'Parâmetros obrigatórios ausentes'}, status=400)
+
+        with onto:
+            # Localiza indivíduos e propriedade
+            subject = onto.search_one(iri=f"*{subject_name}") or onto.search_one(label=subject_name)
+            if not subject:
+                return JsonResponse({'status': 'error', 'message': f'Indivíduo sujeito "{subject_name}" não encontrado'}, status=404)
+
+            obj_prop = onto.search_one(iri=f"*{object_property_name}") or onto.search_one(label=object_property_name)
+            if not obj_prop or not isinstance(obj_prop, ObjectPropertyClass):
+                return JsonResponse({'status': 'error', 'message': f'Propriedade "{object_property_name}" não encontrada ou não é uma ObjectProperty'}, status=400)
+
+            if action == 'add':
+                target = onto.search_one(iri=f"*{target_name}") or onto.search_one(label=target_name)
+                if not target:
+                    return JsonResponse({'status': 'error', 'message': f'Indivíduo destino "{target_name}" não encontrado'}, status=404)
+                getattr(subject, obj_prop.name).append(target)
+
+            elif action == 'remove':
+                target = onto.search_one(iri=f"*{target_name}") or onto.search_one(label=target_name)
+                if not target:
+                    return JsonResponse({'status': 'error', 'message': f'Indivíduo destino "{target_name}" não encontrado'}, status=404)
+                current_values = getattr(subject, obj_prop.name)
+                if target in current_values:
+                    current_values.remove(target)
+                else:
+                    return JsonResponse({'status': 'error', 'message': f'Relação não encontrada entre "{subject_name}" e "{target_name}" via "{object_property_name}"'}, status=404)
+
+            elif action == 'replace':
+                if not replace_with_name:
+                    return JsonResponse({'status': 'error', 'message': 'Parâmetro "replace_with" obrigatório para ação replace'}, status=400)
+                old_target = onto.search_one(iri=f"*{target_name}") or onto.search_one(label=target_name)
+                new_target = onto.search_one(iri=f"*{replace_with_name}") or onto.search_one(label=replace_with_name)
+                if not old_target or not new_target:
+                    return JsonResponse({'status': 'error', 'message': 'Indivíduos de origem ou destino não encontrados'}, status=404)
+                current_values = getattr(subject, obj_prop.name)
+                if old_target in current_values:
+                    current_values.remove(old_target)
+                    current_values.append(new_target)
+                else:
+                    return JsonResponse({'status': 'error', 'message': f'Relação original não encontrada entre "{subject_name}" e "{target_name}"'}, status=404)
+
+            else:
+                return JsonResponse({'status': 'error', 'message': 'Ação inválida. Use "add", "remove" ou "replace"'}, status=400)
+
+            # Salva alterações
+            onto.save(file=onto_path, format="rdfxml")
+
+        # Atualiza lista de indivíduos na resposta
+        updated_individuals = [serialize_individual(ind) for ind in onto.individuals()]
+
+        return JsonResponse({'status': 'success', 'message': 'Relacionamento atualizado com sucesso!', 'ontology': {'individuals': updated_individuals}})
+
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+import json
+import traceback
+import types
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from owlready2 import And, ObjectProperty, FunctionalProperty, TransitiveProperty, SymmetricProperty
+from types import new_class
+
+@csrf_exempt
+def create_object_property_view(request):
+    global onto, onto_path
+
+    if onto is None and onto_path:
+        onto = get_ontology(onto_path).load()
+
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    try:
+        data = json.loads(request.body)
+        name = data.get('property_name')
+        domain_names = data.get('domain', [])
+        range_names = data.get('range', [])
+        characteristics = data.get('characteristics', [])
+
+        if not name:
+            return JsonResponse({'status': 'error', 'message': 'Nome é obrigatório'}, status=400)
+
+        # Busca por classes de domínio
+        domains = []
+        for domain_name in domain_names:
+            cls = onto.search_one(iri=f"*{domain_name}") or onto.search_one(label=domain_name)
+            if not cls:
+                return JsonResponse({'status': 'error', 'message': f'Domínio "{domain_name}" não encontrado'}, status=400)
+            domains.append(cls)
+
+        # Busca por classes de range
+        ranges = []
+        for range_name in range_names:
+            cls = onto.search_one(iri=f"*{range_name}") or onto.search_one(label=range_name)
+            if not cls:
+                return JsonResponse({'status': 'error', 'message': f'Range "{range_name}" não encontrado'}, status=400)
+            ranges.append(cls)
+
+        with onto:
+            # Criação da nova propriedade seguindo padrão Owlready2
+            NewProperty = new_class(name, (ObjectProperty,))
+            NewProperty.namespace = onto
+
+            # Define domínio
+            if domains:
+                NewProperty.domain = domains if len(domains) == 1 else [And(domains)]
+
+            # Define range
+            if ranges:
+                NewProperty.range = ranges if len(ranges) == 1 else [And(ranges)]
+
+            # Define características
+            if 'functional' in [c.lower() for c in characteristics]:
+                NewProperty.is_a.append(FunctionalProperty)
+            if 'transitive' in [c.lower() for c in characteristics]:
+                NewProperty.is_a.append(TransitiveProperty)
+            if 'symmetric' in [c.lower() for c in characteristics]:
+                NewProperty.is_a.append(SymmetricProperty)
+
+            # Salva a ontologia atualizada
+            onto.save(file=onto_path, format="rdfxml")
+
+        # Retorna a lista atualizada
+        object_properties = [serialize_property(p) for p in onto.object_properties()]
+        return JsonResponse({
+            'status': 'success',
+            'message': 'Propriedade criada com sucesso',
+            'object_properties': object_properties
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+import json
+import datetime
+import traceback
+import types
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from owlready2 import get_ontology, DataProperty, FunctionalProperty, And, normstr, locstr
+
+@csrf_exempt
+def create_data_property_view(request):
+    global onto, onto_path
+
+    # Carrega ontologia se ainda não estiver em memória
+    if onto is None and onto_path:
+        onto = get_ontology(onto_path).load()
+
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+
+    try:
+        data = json.loads(request.body)
+        name = data.get('property_name')
+        domain_names = data.get('domain', [])
+        data_type_str = data.get('range')  # ex: "str", "int", "xsd:float", etc.
+        characteristics = data.get('characteristics', [])
+
+        if not name:
+            return JsonResponse({'status': 'error', 'message': 'Nome é obrigatório'}, status=400)
+        if not data_type_str:
+            return JsonResponse({'status': 'error', 'message': 'Tipo de dado (range) é obrigatório'}, status=400)
+
+        # Mapeamento dos tipos de dados para OwlReady2 (tipos Python nativos)
+        type_map = {
+            'str': str,
+            'normstr': normstr,
+            'locstr': locstr,
+            'int': int,
+            'float': float,
+            'bool': bool,
+            'date': datetime.date,
+            'time': datetime.time,
+            'datetime': datetime.datetime,
+        }
+
+        # Normaliza chave, removendo prefixo xsd: se presente
+        key = data_type_str.lower()
+        if key.startswith('xsd:'):
+            key = key.split(':', 1)[1]
+
+        data_type = type_map.get(key)
+        if data_type is None:
+            return JsonResponse({'status': 'error', 'message': f'Tipo de dado "{data_type_str}" não suportado'}, status=400)
+
+        # Busca por classes de domínio
+        domains = []
+        for domain_name in domain_names:
+            cls = onto.search_one(iri=f"*{domain_name}") or onto.search_one(label=domain_name)
+            if not cls:
+                return JsonResponse({'status': 'error', 'message': f'Domínio "{domain_name}" não encontrado'}, status=400)
+            domains.append(cls)
+
+        with onto:
+            # Criação da nova propriedade usando types.new_class
+            NewDataProp = types.new_class(name, (DataProperty,))
+            NewDataProp.namespace = onto
+
+            # Define domínio
+            if domains:
+                NewDataProp.domain = domains if len(domains) == 1 else [And(domains)]
+
+            # Define range como tipo primitivo
+            NewDataProp.range = [data_type]
+
+            # Define características (functional)
+            if any(c.lower() == 'functional' for c in characteristics):
+                NewDataProp.is_a.append(FunctionalProperty)
+
+            # Salva a ontologia atualizada
+            onto.save(file=onto_path, format='rdfxml')
+
+        return JsonResponse({'status': 'success', 'message': 'Propriedade de dados criada com sucesso'})
+
+    except Exception as e:
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+#################### DL QUERY #############################
+
+import json
+import traceback
+import logging
+import hashlib
+import time
+from datetime import datetime, timedelta
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
+from django.conf import settings
+from owlready2 import *
+import threading
+
+logger = logging.getLogger(__name__)
+
+# Cache em memória para queries DL
+class DLQueryCache:
+    """Cache em memória para DL queries com TTL e invalidação inteligente"""
+    
+    def __init__(self, default_ttl=300):  # 5 minutos por padrão
+        self.cache = {}
+        self.timestamps = {}
+        self.default_ttl = default_ttl
+        self.lock = threading.RLock()
+        self.ontology_hash = None
+    
+    def _generate_ontology_hash(self, ontology):
+        """Gera hash da ontologia para detectar mudanças.
+
+        Estratégia principal: salvar a ontologia em arquivo (rdfxml) e hashear o seu conteúdo
+        (mais robusto que contar classes/indivíduos). Em caso de falha, volta a usar a
+        heurística anterior (contagens).
+        """
+        try:
+            import tempfile, os
+
+            # Tenta salvar a ontologia em arquivo temporário
+            with tempfile.NamedTemporaryFile(suffix='.owl', delete=False) as tmp_file:
+                tmp_name = tmp_file.name
+            try:
+                ontology.save(file=tmp_name, format='rdfxml')
+                with open(tmp_name, 'rb') as f:
+                    content_bytes = f.read()
+                file_hash = hashlib.md5(content_bytes).hexdigest()
+                return file_hash
+            finally:
+                try:
+                    os.unlink(tmp_name)
+                except Exception:
+                    pass
+
+        except Exception:
+            # Fallback: heurística por contagens (menos robusta)
+            try:
+                classes_count = len(list(ontology.classes()))
+                individuals_count = len(list(ontology.individuals()))
+                obj_props_count = len(list(ontology.object_properties()))
+                data_props_count = len(list(ontology.data_properties()))
+                content = f"{classes_count}:{individuals_count}:{obj_props_count}:{data_props_count}"
+                return hashlib.md5(content.encode()).hexdigest()
+            except Exception:
+                return str(time.time())
+    
+    def _is_ontology_changed(self, ontology):
+        """Verifica se a ontologia mudou desde o último cache"""
+        current_hash = self._generate_ontology_hash(ontology)
+        if self.ontology_hash != current_hash:
+            self.ontology_hash = current_hash
+            return True
+        return False
+    
+    def get(self, query, ontology=None):
+        """Recupera resultado do cache"""
+        with self.lock:
+            # Se ontologia mudou, limpa cache
+            if ontology and self._is_ontology_changed(ontology):
+                logger.info("Ontologia modificada, limpando cache DL")
+                self.clear()
+                return None
+            
+            query_hash = hashlib.md5(query.encode()).hexdigest()
+            
+            if query_hash in self.cache:
+                timestamp = self.timestamps.get(query_hash)
+                if timestamp and (datetime.now() - timestamp).seconds < self.default_ttl:
+                    logger.debug(f"Cache HIT para query: {query[:50]}...")
+                    return self.cache[query_hash]
+                else:
+                    # Cache expirado
+                    self._remove_expired(query_hash)
+            
+            logger.debug(f"Cache MISS para query: {query[:50]}...")
+            return None
+    
+    def set(self, query, result, ttl=None):
+        """Armazena resultado no cache"""
+        with self.lock:
+            query_hash = hashlib.md5(query.encode()).hexdigest()
+            self.cache[query_hash] = result
+            self.timestamps[query_hash] = datetime.now()
+            logger.debug(f"Cache SET para query: {query[:50]}...")
+    
+    def _remove_expired(self, query_hash):
+        """Remove entrada expirada do cache"""
+        self.cache.pop(query_hash, None)
+        self.timestamps.pop(query_hash, None)
+    
+    def clear(self):
+        """Limpa todo o cache"""
+        self.cache.clear()
+        self.timestamps.clear()
+        logger.info("Cache DL limpo")
+    
+    def get_stats(self):
+        """Retorna estatísticas do cache"""
+        with self.lock:
+            total_entries = len(self.cache)
+            # Remove entradas expiradas
+            now = datetime.now()
+            expired = 0
+            for query_hash, timestamp in list(self.timestamps.items()):
+                if (now - timestamp).seconds >= self.default_ttl:
+                    self._remove_expired(query_hash)
+                    expired += 1
+            
+            return {
+                'total_entries': total_entries,
+                'expired_removed': expired,
+                'current_entries': len(self.cache)
+            }
+
+# Instância global do cache
+dl_cache = DLQueryCache()
+
+class HermiTDLQueryEngine:
+    """Motor de DL Query integrado com HermiT reasoner"""
+    
+    def __init__(self, ontology):
+        self.onto = ontology
+        self.reasoner = None
+        self._setup_reasoner()
+    
+    def _setup_reasoner(self):
+        """Configura o HermiT reasoner"""
+        try:
+            # Configura o HermiT
+            sync_reasoner_hermit(self.onto, debug=False)
+            self.reasoner = "hermit"
+            logger.info("HermiT reasoner configurado com sucesso")
+        except Exception as e:
+            logger.warning(f"Falha ao configurar HermiT: {e}. Usando reasoner padrão.")
+            try:
+                # Fallback para Pellet se disponível
+                sync_reasoner_pellet(self.onto, debug=False)
+                self.reasoner = "pellet"
+                logger.info("Pellet reasoner configurado como fallback")
+            except:
+                # Fallback final para reasoner interno do owlready2
+                self.reasoner = "owlready"
+                logger.info("Usando reasoner interno do owlready2")
+    
+    def execute_query(self, query_string):
+        """Executa DL query usando reasoner"""
+        try:
+            # Verifica cache primeiro
+            cached_result = dl_cache.get(query_string, self.onto)
+            if cached_result is not None:
+                return cached_result
+            
+            logger.info(f"Executando DL query com {self.reasoner}: {query_string}")
+            
+            # Parse da query
+            parsed_query = self._parse_dl_expression(query_string)
+            if not parsed_query:
+                return []
+            
+            # Executa a query usando o reasoner
+            if self.reasoner in ["hermit", "pellet"]:
+                instances = self._execute_with_reasoner(parsed_query)
+            else:
+                instances = self._execute_with_owlready(parsed_query, query_string)
+            
+            # Serializa resultados
+            results = self._serialize_instances(instances)
+            
+            # Armazena no cache
+            dl_cache.set(query_string, results)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Erro ao executar DL query: {e}", exc_info=True)
+            raise
+    
+    def _parse_dl_expression(self, query_string):
+        """Converte string DL para expressão owlready2"""
+        try:
+            query_string = query_string.strip()
+            
+            # Queries simples - nome da classe
+            if ' ' not in query_string:
+                cls = self._find_class(query_string)
+                return cls
+            
+            # Queries complexas usando owlready2 syntax
+            return self._parse_complex_expression(query_string)
+            
+        except Exception as e:
+            logger.error(f"Erro ao parsear expressão DL: {e}")
+            return None
+    
+    def _parse_complex_expression(self, query_string):
+        """Parseia expressões DL complexas"""
+        try:
+            # Substitui operadores DL por sintaxe Python/owlready2
+            expression = query_string
+            
+            # Handle 'and' -> &
+            if ' and ' in expression.lower():
+                parts = [p.strip() for p in expression.split(' and ')]
+                parsed_parts = []
+                for part in parts:
+                    parsed_part = self._parse_single_expression(part)
+                    if parsed_part:
+                        parsed_parts.append(parsed_part)
+                
+                if len(parsed_parts) > 1:
+                    # Cria intersecção usando owlready2
+                    result = parsed_parts[0]
+                    for part in parsed_parts[1:]:
+                        result = result & part
+                    return result
+                elif len(parsed_parts) == 1:
+                    return parsed_parts[0]
+            
+            # Handle 'or' -> |
+            elif ' or ' in expression.lower():
+                parts = [p.strip() for p in expression.split(' or ')]
+                parsed_parts = []
+                for part in parts:
+                    parsed_part = self._parse_single_expression(part)
+                    if parsed_part:
+                        parsed_parts.append(parsed_part)
+                
+                if len(parsed_parts) > 1:
+                    result = parsed_parts[0]
+                    for part in parsed_parts[1:]:
+                        result = result | part
+                    return result
+                elif len(parsed_parts) == 1:
+                    return parsed_parts[0]
+            
+            # Handle 'not'
+            elif expression.lower().startswith('not '):
+                inner_expr = expression[4:].strip()
+                parsed_inner = self._parse_single_expression(inner_expr)
+                if parsed_inner:
+                    return Not(parsed_inner)
+            
+            # Expressão simples
+            else:
+                return self._parse_single_expression(expression)
+            
+        except Exception as e:
+            logger.error(f"Erro ao parsear expressão complexa '{query_string}': {e}")
+            return None
+    
+    def _parse_single_expression(self, expression):
+        """Parseia uma expressão DL simples"""
+        try:
+            expression = expression.strip()
+            
+            # Classe simples
+            if ' ' not in expression:
+                return self._find_class(expression)
+            
+            # Restrições existenciais: "property some class"
+            if ' some ' in expression.lower():
+                parts = expression.split(' some ', 1)
+                if len(parts) == 2:
+                    prop_name, class_name = parts[0].strip(), parts[1].strip()
+                    prop = self._find_property(prop_name)
+                    target_cls = self._find_class(class_name) if class_name.lower() != 'thing' else Thing
+                    
+                    if prop and target_cls:
+                        return prop.some(target_cls)
+            
+            # Restrições de valor: "property value individual"
+            elif ' value ' in expression.lower():
+                parts = expression.split(' value ', 1)
+                if len(parts) == 2:
+                    prop_name, individual_name = parts[0].strip(), parts[1].strip()
+                    prop = self._find_property(prop_name)
+                    individual = self.onto.search_one(iri=f"*{individual_name}")
+                    
+                    if prop and individual:
+                        return prop.value(individual)
+            
+            # Restrições de cardinalidade
+            elif any(card in expression.lower() for card in [' min ', ' max ', ' exactly ']):
+                return self._parse_cardinality_expression(expression)
+            
+            # Se não reconhecer, tenta como classe
+            return self._find_class(expression)
+            
+        except Exception as e:
+            logger.error(f"Erro ao parsear expressão simples '{expression}': {e}")
+            return None
+    
+    def _parse_cardinality_expression(self, expression):
+        """Parseia restrições de cardinalidade"""
+        try:
+            for card_type in ['exactly', 'min', 'max']:
+                if f' {card_type} ' in expression.lower():
+                    parts = expression.lower().split(f' {card_type} ')
+                    if len(parts) == 2:
+                        prop_name = parts[0].strip()
+                        rest = parts[1].strip().split(' ', 1)
+                        if len(rest) == 2:
+                            count_str, class_name = rest
+                            try:
+                                count = int(count_str)
+                                prop = self._find_property(prop_name)
+                                target_cls = self._find_class(class_name)
+                                
+                                if prop and target_cls:
+                                    if card_type == 'exactly':
+                                        return prop.exactly(count, target_cls)
+                                    elif card_type == 'min':
+                                        return prop.min(count, target_cls)
+                                    elif card_type == 'max':
+                                        return prop.max(count, target_cls)
+                            except ValueError:
+                                continue
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao parsear cardinalidade '{expression}': {e}")
+            return None
+    
+    def _find_class(self, class_name):
+        """Encontra classe na ontologia"""
+        if class_name.lower() == 'thing':
+            return Thing
+        
+        # Busca exata
+        cls = self.onto.search_one(iri=f"*{class_name}")
+        if cls and hasattr(cls, 'is_a'):
+            return cls
+        
+        # Busca case-insensitive
+        for ontology_cls in self.onto.classes():
+            if ontology_cls.name and ontology_cls.name.lower() == class_name.lower():
+                return ontology_cls
+        
+        return None
+    
+    def _find_property(self, prop_name):
+        """Encontra propriedade na ontologia"""
+        # Busca exata
+        prop = self.onto.search_one(iri=f"*{prop_name}")
+        if prop and isinstance(prop, (ObjectPropertyClass, DataPropertyClass)):
+            return prop
+        
+        # Busca case-insensitive
+        all_props = list(self.onto.object_properties()) + list(self.onto.data_properties())
+        for prop in all_props:
+            if prop.name and prop.name.lower() == prop_name.lower():
+                return prop
+        
+        return None
+    
+    def _execute_with_reasoner(self, parsed_query):
+        """Executa query usando HermiT/Pellet"""
+        try:
+            if not parsed_query:
+                return []
+            
+            # Para expressões owlready2, busca instâncias que satisfazem a expressão
+            instances = []
+            
+            # Se é uma classe simples
+            if hasattr(parsed_query, 'instances'):
+                instances = list(parsed_query.instances())
+            else:
+                # Para expressões complexas, verifica todos os indivíduos
+                for individual in self.onto.individuals():
+                    try:
+                        # Verifica se o indivíduo satisfaz a expressão
+                        if self._individual_satisfies_expression(individual, parsed_query):
+                            instances.append(individual)
+                    except:
+                        continue
+            
+            return instances
+            
+        except Exception as e:
+            logger.error(f"Erro ao executar com reasoner: {e}")
+            return []
+    
+    def _execute_with_owlready(self, parsed_query, original_query):
+        """Executa query usando reasoner interno do owlready2"""
+        try:
+            if not parsed_query:
+                # Fallback para parser simples
+                return self._simple_query_execution(original_query)
+            
+            if hasattr(parsed_query, 'instances'):
+                return list(parsed_query.instances())
+            
+            # Para expressões que não têm método instances
+            instances = []
+            for individual in self.onto.individuals():
+                try:
+                    if self._individual_satisfies_expression(individual, parsed_query):
+                        instances.append(individual)
+                except:
+                    continue
+            
+            return instances
+            
+        except Exception as e:
+            logger.error(f"Erro ao executar com owlready: {e}")
+            return self._simple_query_execution(original_query)
+    
+    def _individual_satisfies_expression(self, individual, expression):
+        """Verifica se um indivíduo satisfaz uma expressão DL"""
+        try:
+            # Para classes simples
+            if hasattr(expression, 'name') and hasattr(individual, 'is_a'):
+                return expression in individual.is_a or any(
+                    hasattr(cls, '__mro__') and expression in cls.__mro__ 
+                    for cls in individual.is_a
+                )
+            
+            # Para expressões mais complexas, esta é uma implementação simplificada
+            # O reasoner HermiT/Pellet faria isso de forma mais robusta
+            return False
+            
+        except Exception:
+            return False
+    
+    def _simple_query_execution(self, query_string):
+        """Fallback para execução simples sem reasoner avançado"""
+        try:
+            # Implementação básica para quando o reasoner falha
+            if ' ' not in query_string:
+                cls = self._find_class(query_string)
+                if cls:
+                    return [ind for ind in self.onto.individuals() 
+                           if cls in ind.is_a]
+            
+            return []
+            
+        except Exception:
+            return []
+    
+    def _serialize_instances(self, instances):
+        """Serializa instâncias para JSON"""
+        results = []
+        seen = set()
+        
+        for instance in instances:
+            if hasattr(instance, 'name') and instance.name:
+                if instance.name not in seen:
+                    seen.add(instance.name)
+                    result_item = {
+                        'name': instance.name,
+                        'iri': getattr(instance, 'iri', ''),
+                        'types': [cls.name for cls in instance.is_a 
+                                if hasattr(cls, 'name') and cls.name],
+                        'inferred_types': []  # Pode ser preenchido pelo reasoner
+                    }
+                    
+                    # Adiciona propriedades principais
+                    properties = {}
+                    for prop in instance.get_properties():
+                        try:
+                            values = getattr(instance, prop.name, [])
+                            if not isinstance(values, list):
+                                values = [values] if values is not None else []
+                            
+                            # Serializa valores
+                            serialized_values = []
+                            for value in values:
+                                if hasattr(value, 'name'):
+                                    serialized_values.append(value.name)
+                                else:
+                                    serialized_values.append(str(value))
+                            
+                            if serialized_values:
+                                properties[prop.name] = serialized_values
+                        except:
+                            continue
+                    
+                    result_item['properties'] = properties
+                    results.append(result_item)
+        
+        return results
+
+
+@csrf_exempt
+def dl_query_view(request):
+    """
+    View para executar DL queries com HermiT reasoner e cache
+    
+    GET /dl-query/ - Retorna informações sobre o endpoint
+    POST /dl-query/ - Executa DL query
+    {
+        "query": "Component and (hasValue some Integer)",
+        "query_type": "class_expression",
+        "use_cache": true,
+        "reasoner": "hermit"  // hermit, pellet, owlready
+    }
+    """
+    global onto, onto_path
+    
+    # Suporte a GET para teste/documentação
+    if request.method == 'GET':
+        return JsonResponse({
+            'status': 'info',
+            'message': 'DL Query endpoint está funcionando',
+            'methods': ['GET', 'POST'],
+            'ontology_loaded': onto is not None,
+            'ontology_path': onto_path if onto_path else None,
+            'example_query': {
+                'query': 'Component and (hasValue some Integer)',
+                'method': 'POST',
+                'content_type': 'application/json'
+            },
+            'available_classes': [cls.name for cls in onto.classes()][:10] if onto else [],
+            'available_properties': [prop.name for prop in onto.object_properties()][:10] if onto else []
+        })
+    
+    if request.method != 'POST':
+        return JsonResponse({
+            'status': 'error', 
+            'message': 'Apenas métodos GET (info) e POST (query) são permitidos'
+        }, status=405)
+    
+    # Verifica se ontologia está carregada
+    if onto is None:
+        if onto_path:
+            try:
+                onto = get_ontology(onto_path).load()
+            except Exception as e:
+                logger.error(f"Erro ao carregar ontologia: {e}")
+        
+        if onto is None:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Nenhuma ontologia carregada'
+            }, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        query_string = data.get('query', '').strip()
+        query_type = data.get('query_type', 'class_expression')
+        use_cache = data.get('use_cache', True)
+        preferred_reasoner = data.get('reasoner', 'hermit')
+        
+        if not query_string:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Query é obrigatória'
+            }, status=400)
+        
+        start_time = time.time()
+        logger.info(f"Executando DL query: {query_string}")
+        
+        # Inicializa motor de query com reasoner
+        query_engine = HermiTDLQueryEngine(onto)
+        
+        # Executa a query
+        instances = query_engine.execute_query(query_string)
+        
+        execution_time = time.time() - start_time
+        
+        logger.info(f"DL query executada em {execution_time:.3f}s. {len(instances)} resultados encontrados.")
+        
+        # Estatísticas do cache
+        cache_stats = dl_cache.get_stats()
+        
+        return JsonResponse({
+            'status': 'success',
+            'message': f'Query executada com sucesso em {execution_time:.3f}s. {len(instances)} instâncias encontradas.',
+            'results': {
+                'instances': instances,
+                'total': len(instances),
+                'query': query_string,
+                'execution_time': execution_time,
+                'reasoner': query_engine.reasoner,
+                'from_cache': execution_time < 0.01  # Indica se veio do cache
+            },
+            'cache_stats': cache_stats
+        })
+        
+    except json.JSONDecodeError:
+        return JsonResponse({
+            'status': 'error',
+            'message': 'JSON inválido'
+        }, status=400)
+    
+    except Exception as e:
+        logger.error(f"Erro ao executar DL query: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Erro ao executar query: {str(e)}'
+        }, status=500)
+
+
+@csrf_exempt
+def clear_dl_cache_view(request):
+    """
+    Limpa o cache de DL queries
+    
+    POST /clear-dl-cache/
+    """
+    if request.method != 'POST':
+        return JsonResponse({
+            'status': 'error',
+            'message': 'Método não permitido'
+        }, status=405)
+    
+    try:
+        stats_before = dl_cache.get_stats()
+        dl_cache.clear()
+        
+        return JsonResponse({
+            'status': 'success',
+            'message': 'Cache limpo com sucesso',
+            'cleared_entries': stats_before['current_entries']
+        })
+        
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Erro ao limpar cache: {str(e)}'
+        }, status=500)
+
+
+@csrf_exempt
+def dl_cache_stats_view(request):
+    """
+    Retorna estatísticas do cache DL
+    
+    GET /dl-cache-stats/
+    """
+    if request.method != 'GET':
+        return JsonResponse({
+            'status': 'error',
+            'message': 'Método não permitido'
+        }, status=405)
+    
+    try:
+        stats = dl_cache.get_stats()
+        
+        return JsonResponse({
+            'status': 'success',
+            'cache_stats': stats
+        })
+        
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Erro ao obter estatísticas: {str(e)}'
+        }, status=500)
+
+
+@csrf_exempt
+def add_query_result_to_ontology_view(request):
+    """
+    Adiciona o resultado de uma DL query como nova classe na ontologia
+    Limpa o cache automaticamente após modificar a ontologia
+    
+    POST /add-query-result-to-ontology/
+    {
+        "query": "Component and hasValue some Integer",
+        "instances": [{"name": "Instance1"}, {"name": "Instance2"}],
+        "class_name": "QueryResult_123456"
+    }
+    """
+    global onto, onto_path
+    
+    if request.method != 'POST':
+        return JsonResponse({
+            'status': 'error',
+            'message': 'Método não permitido'
+        }, status=405)
+    
+    if onto is None:
+        return JsonResponse({
+            'status': 'error',
+            'message': 'Nenhuma ontologia carregada'
+        }, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        query = data.get('query', '')
+        instances_data = data.get('instances', [])
+        class_name = data.get('class_name', f'QueryResult_{len(list(onto.classes()))}')
+        
+        if not instances_data:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Nenhuma instância para adicionar'
+            }, status=400)
+        
+        with onto:
+            # Cria nova classe
+            NewClass = types.new_class(class_name, (Thing,))
+            NewClass.comment = [f"Classe criada a partir da DL query: {query}"]
+            
+            # Adiciona as instâncias à nova classe
+            added_count = 0
+            for instance_data in instances_data:
+                instance_name = instance_data.get('name')
+                if instance_name:
+                    # Busca a instância existente
+                    existing_instance = onto.search_one(iri=f"*{instance_name}")
+                    if existing_instance:
+                        # Adiciona a nova classe aos tipos da instância
+                        existing_instance.is_a.append(NewClass)
+                        added_count += 1
+            
+            # Salva a ontologia
+            if onto_path:
+                onto.save(file=onto_path, format="rdfxml")
+        
+        # Limpa o cache pois a ontologia foi modificada
+        dl_cache.clear()
+        
+        logger.info(f"Resultado da query adicionado como classe '{class_name}' com {added_count} instâncias")
+        
+        return JsonResponse({
+            'status': 'success',
+            'message': f'Resultado adicionado à ontologia como classe "{class_name}" com {added_count} instâncias. Cache limpo.'
+        })
+        
+    except Exception as e:
+        logger.error(f"Erro ao adicionar resultado à ontologia: {str(e)}", exc_info=True)
+        return JsonResponse({
+            'status': 'error',
+            'message': f'Erro ao adicionar à ontologia: {str(e)}'
+        }, status=500)
+
+
+########################## DL-QUERY SPARQL #################################
+
+# views.py - Versão expandida com SPARQL e melhorias no HermiT
+
+from owlready2 import *
+import os, json, traceback, logging, hashlib, time, tempfile, threading
+from datetime import datetime, timedelta
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
+from django.conf import settings
+import rdflib
+from rdflib.plugins.sparql import prepareQuery
+from rdflib import Graph, Namespace, RDF, RDFS, OWL
+
+logger = logging.getLogger(__name__)
+
+# Namespace definitions for SPARQL
+OWL_NS = Namespace("http://www.w3.org/2002/07/owl#")
+RDF_NS = Namespace("http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+RDFS_NS = Namespace("http://www.w3.org/2000/01/rdf-schema#")
+
+class EnhancedDLQueryEngine:
+    """Motor de DL Query aprimorado com SPARQL e HermiT"""
+    
+    def __init__(self, ontology):
+        self.onto = ontology
+        self.reasoner = None
+        self.rdf_graph = None
+        self.sparql_endpoint = None
+        self._setup_reasoner()
+        self._setup_sparql_graph()
+    
+    def _setup_reasoner(self):
+        """Configura o HermiT reasoner com melhor tratamento de erros"""
+        try:
+            # Configura HermiT com timeout
+            sync_reasoner_hermit(self.onto, debug=False, infer_property_values=True)
+            self.reasoner = "hermit"
+            logger.info("HermiT reasoner configurado com sucesso")
+        except Exception as e:
+            logger.warning(f"Falha ao configurar HermiT: {e}")
+            try:
+                # Fallback para Pellet
+                sync_reasoner_pellet(self.onto, debug=False)
+                self.reasoner = "pellet"
+                logger.info("Pellet reasoner configurado como fallback")
+            except Exception as e2:
+                logger.warning(f"Falha ao configurar Pellet: {e2}")
+                # Usa reasoner interno
+                self.reasoner = "owlready"
+                logger.info("Usando reasoner interno do owlready2")
+    
+    def _setup_sparql_graph(self):
+        """Configura grafo RDF para queries SPARQL"""
+        try:
+            self.rdf_graph = Graph()
+            
+            # Salva ontologia em arquivo temporário
+            with tempfile.NamedTemporaryFile(suffix='.owl', delete=False) as tmp_file:
+                self.onto.save(file=tmp_file.name, format="rdfxml")
+                
+                # Carrega no grafo RDF
+                self.rdf_graph.parse(tmp_file.name, format="xml")
+                
+                # Remove arquivo temporário
+                os.unlink(tmp_file.name)
+            
+            # Adiciona namespaces comuns
+            self.rdf_graph.bind("owl", OWL_NS)
+            self.rdf_graph.bind("rdf", RDF_NS)
+            self.rdf_graph.bind("rdfs", RDFS_NS)
+            
+            # Adiciona namespace da ontologia
+            if self.onto.base_iri:
+                onto_ns = Namespace(self.onto.base_iri)
+                self.rdf_graph.bind("onto", onto_ns)
+            
+            logger.info(f"Grafo SPARQL configurado com {len(self.rdf_graph)} triplas")
+            
+        except Exception as e:
+            logger.error(f"Erro ao configurar grafo SPARQL: {e}")
+            self.rdf_graph = None
+    
+    def execute_dl_query(self, query_string, query_type="class_expression"):
+        """Executa DL query usando HermiT"""
+        try:
+            logger.info(f"Executando DL query: {query_string}")
+            
+            # Parse da expressão DL
+            parsed_query = self._parse_dl_expression(query_string)
+            if not parsed_query:
+                return []
+            
+            # Executa query baseada no reasoner
+            if self.reasoner == "hermit":
+                instances = self._execute_with_hermit(parsed_query)
+            elif self.reasoner == "pellet":
+                instances = self._execute_with_pellet(parsed_query)
+            else:
+                instances = self._execute_with_owlready(parsed_query)
+            
+            return self._serialize_instances(instances)
+            
+        except Exception as e:
+            logger.error(f"Erro ao executar DL query: {e}", exc_info=True)
+            raise
+    
+    def execute_sparql_query(self, sparql_query):
+        """Executa query SPARQL no grafo RDF"""
+        try:
+            if not self.rdf_graph:
+                raise Exception("Grafo SPARQL não configurado")
+            
+            logger.info(f"Executando SPARQL query: {sparql_query[:100]}...")
+            
+            # Executa query
+            results = self.rdf_graph.query(sparql_query)
+            
+            # Serializa resultados
+            serialized_results = []
+            for row in results:
+                result_row = {}
+                for var_name in results.vars:
+                    value = row[var_name]
+                    if value:
+                        # Converte valores RDF para formato JSON
+                        if hasattr(value, 'toPython'):
+                            result_row[str(var_name)] = value.toPython()
+                        else:
+                            result_row[str(var_name)] = str(value)
+                    else:
+                        result_row[str(var_name)] = None
+                serialized_results.append(result_row)
+            
+            return serialized_results
+            
+        except Exception as e:
+            logger.error(f"Erro ao executar SPARQL query: {e}", exc_info=True)
+            raise
+    
+    def _execute_with_hermit(self, parsed_query):
+        """Executa query usando HermiT com inferências"""
+        try:
+            # HermiT já executou as inferências na inicialização
+            instances = []
+            
+            if hasattr(parsed_query, 'instances'):
+                # Para classes simples, pega instâncias diretas e inferidas
+                instances = list(parsed_query.instances())
+            else:
+                # Para expressões complexas, verifica todos os indivíduos
+                for individual in self.onto.individuals():
+                    if self._individual_satisfies_expression(individual, parsed_query):
+                        instances.append(individual)
+            
+            return instances
+            
+        except Exception as e:
+            logger.error(f"Erro ao executar com HermiT: {e}")
+            return []
+    
+    def _parse_dl_expression(self, query_string):
+        """Parser aprimorado para expressões DL"""
+        try:
+            query_string = query_string.strip()
+            
+            # Limpa e normaliza a query
+            query_string = self._normalize_dl_syntax(query_string)
+            
+            # Queries simples - nome da classe
+            if not any(op in query_string.lower() for op in [' and ', ' or ', ' some ', ' only ', ' min ', ' max ', ' exactly ', 'not ']):
+                cls = self._find_class(query_string)
+                return cls
+            
+            # Expressões complexas
+            return self._parse_complex_expression(query_string)
+            
+        except Exception as e:
+            logger.error(f"Erro ao parsear expressão DL: {query_string} - {e}")
+            return None
+    
+    def _normalize_dl_syntax(self, query_string):
+        """Normaliza sintaxe DL para owlready2"""
+        # Substituições comuns
+        replacements = {
+            '⊓': ' and ',  # Intersecção
+            '⊔': ' or ',   # União
+            '∃': ' some ', # Existencial
+            '∀': ' only ', # Universal
+            '¬': 'not ',   # Negação
+            '≥': ' min ',  # Cardinalidade mínima
+            '≤': ' max ',  # Cardinalidade máxima
+            '=': ' exactly ' # Cardinalidade exata
+        }
+        
+        for symbol, replacement in replacements.items():
+            query_string = query_string.replace(symbol, replacement)
+        
+        return query_string
+    
+    def get_available_constructs(self):
+        """Retorna construtos DL disponíveis na ontologia"""
+        try:
+            classes = [cls.name for cls in self.onto.classes() if cls.name]
+            object_props = [prop.name for prop in self.onto.object_properties() if prop.name]
+            data_props = [prop.name for prop in self.onto.data_properties() if prop.name]
+            individuals = [ind.name for ind in self.onto.individuals() if ind.name]
+            
+            return {
+                'classes': sorted(classes),
+                'object_properties': sorted(object_props),
+                'data_properties': sorted(data_props),
+                'individuals': sorted(individuals),
+                'operators': [
+                    'and', 'or', 'not', 'some', 'only', 'value',
+                    'min', 'max', 'exactly', 'Thing'
+                ]
+            }
+            
+        except Exception as e:
+            logger.error(f"Erro ao obter construtos: {e}")
+            return {}
+    
+    def get_sparql_examples(self):
+        """Retorna exemplos de queries SPARQL para a ontologia"""
+        examples = [
+            {
+                'name': 'Todas as classes',
+                'description': 'Lista todas as classes definidas na ontologia',
+                'query': '''
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT DISTINCT ?class ?label WHERE {
+    ?class a owl:Class .
+    OPTIONAL { ?class rdfs:label ?label }
+}
+ORDER BY ?class
+                '''.strip()
+            },
+            {
+                'name': 'Indivíduos e seus tipos',
+                'description': 'Lista todos os indivíduos e suas classes',
+                'query': '''
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?individual ?type ?label WHERE {
+    ?individual a ?type .
+    FILTER(?type != <http://www.w3.org/2002/07/owl#NamedIndividual>)
+    OPTIONAL { ?individual rdfs:label ?label }
+}
+ORDER BY ?individual
+                '''.strip()
+            },
+            {
+                'name': 'Propriedades de objeto',
+                'description': 'Lista propriedades de objeto com domínio e range',
+                'query': '''
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?property ?domain ?range WHERE {
+    ?property a owl:ObjectProperty .
+    OPTIONAL { ?property rdfs:domain ?domain }
+    OPTIONAL { ?property rdfs:range ?range }
+}
+ORDER BY ?property
+                '''.strip()
+            }
+        ]
+        
+        return examples
+    
+    def _individual_satisfies_expression(self, individual, expression):
+        """Verifica se indivíduo satisfaz expressão DL (versão aprimorada)"""
+        try:
+            # Para classes simples
+            if hasattr(expression, 'name'):
+                return (expression in individual.is_a or 
+                       any(expression in getattr(cls, '__mro__', []) for cls in individual.is_a))
+            
+            # Para expressões And
+            if isinstance(expression, And):
+                return all(self._individual_satisfies_expression(individual, cls) 
+                          for cls in expression.Classes)
+            
+            # Para expressões Or
+            if isinstance(expression, Or):
+                return any(self._individual_satisfies_expression(individual, cls) 
+                          for cls in expression.Classes)
+            
+            # Para expressões Not
+            if isinstance(expression, Not):
+                return not self._individual_satisfies_expression(individual, expression.Class)
+            
+            # Para restrições existenciais (some)
+            if hasattr(expression, 'property') and hasattr(expression, 'value'):
+                prop = expression.property
+                target = expression.value
+                
+                # Verifica se indivíduo tem a propriedade apontando para target
+                if hasattr(individual, prop.name):
+                    values = getattr(individual, prop.name)
+                    if not isinstance(values, list):
+                        values = [values] if values else []
+                    
+                    for value in values:
+                        if hasattr(target, 'name'):
+                            # Target é uma classe
+                            if hasattr(value, 'is_a') and target in value.is_a:
+                                return True
+                        else:
+                            # Target é um valor literal
+                            if value == target:
+                                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Erro ao verificar expressão: {e}")
+            return False
+
+
+# Views aprimoradas
+
+@csrf_exempt
+def enhanced_dl_query_view(request):
+    """
+    View aprimorada para DL queries com suporte a SPARQL
+    
+    POST /api/dl-query/
+    {
+        "query": "Component and (hasValue some Integer)",
+        "query_type": "dl_expression",  // ou "sparql"
+        "use_reasoning": true,
+        "include_inferred": true,
+        "format": "detailed"  // "simple" ou "detailed"
+    }
+    """
+    global onto, onto_path
+    
+    if request.method == 'GET':
+        # Retorna informações e exemplos
+        if onto:
+            engine = EnhancedDLQueryEngine(onto)
+            constructs = engine.get_available_constructs()
+            sparql_examples = engine.get_sparql_examples()
+        else:
+            constructs = {}
+            sparql_examples = []
+        
+        return JsonResponse({
+            'status': 'info',
+            'message': 'Enhanced DL Query endpoint',
+            'ontology_loaded': onto is not None,
+            'reasoner_available': True,
+            'sparql_available': True,
+            'available_constructs': constructs,
+            'sparql_examples': sparql_examples,
+            'dl_examples': [
+                'Component',
+                'Component and hasValue some Integer',
+                'hasFeature some (Feature and hasType value TypeA)',
+                'Person or (hasAge min 18 Thing)',
+                'not (hasStatus value Inactive)'
+            ]
+        })
+    
+    if request.method != 'POST':
+        return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+    
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Nenhuma ontologia carregada'}, status=400)
+    
+    try:
+        data = json.loads(request.body)
+        query = data.get('query', '').strip()
+        query_type = data.get('query_type', 'dl_expression')
+        use_reasoning = data.get('use_reasoning', True)
+        include_inferred = data.get('include_inferred', True)
+        result_format = data.get('format', 'detailed')
+        
+        if not query:
+            return JsonResponse({'status': 'error', 'message': 'Query é obrigatória'}, status=400)
+        
+        start_time = time.time()
+        
+        # Inicializa engine
+        engine = EnhancedDLQueryEngine(onto)
+        
+        # Executa query baseada no tipo
+        if query_type == 'sparql':
+            results = engine.execute_sparql_query(query)
+            result_type = 'sparql_results'
+        else:
+            results = engine.execute_dl_query(query, query_type)
+            result_type = 'dl_instances'
+        
+        execution_time = time.time() - start_time
+        
+        # Formata resposta
+        response = {
+            'status': 'success',
+            'message': f'Query executada em {execution_time:.3f}s',
+            'query': {
+                'original': query,
+                'type': query_type,
+                'reasoning_used': use_reasoning,
+                'reasoner': engine.reasoner
+            },
+            'results': {
+                result_type: results,
+                'total': len(results),
+                'execution_time': execution_time
+            }
+        }
+        
+        # Adiciona metadados se formato detalhado
+        if result_format == 'detailed':
+            response['metadata'] = {
+                'ontology_stats': {
+                    'classes': len(list(onto.classes())),
+                    'individuals': len(list(onto.individuals())),
+                    'object_properties': len(list(onto.object_properties())),
+                    'data_properties': len(list(onto.data_properties()))
+                },
+                'reasoning_stats': {
+                    'reasoner_used': engine.reasoner,
+                    'inferences_applied': use_reasoning
+                }
+            }
+        
+        return JsonResponse(response)
+        
+    except json.JSONDecodeError:
+        return JsonResponse({'status': 'error', 'message': 'JSON inválido'}, status=400)
+    except Exception as e:
+        logger.error(f"Erro na enhanced DL query: {e}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+# --- helpers para resolução de identificadores (IRI / nome / rdfs:label) ---
+def resolve_entity_identifier(ontology, identifier, id_type='auto'):
+    """
+    Tenta resolver um identificador fornecido pelo usuário para uma IRI completa.
+    id_type: 'iri', 'name', 'label', ou 'auto' (tenta em ordem label/name/iri)
+    Retorna a IRI (string) ou None.
+    """
+    if not identifier:
+        return None
+
+    # Se o usuário já passou uma IRI óbvia (http://... ou <...>)
+    if id_type == 'iri' or (id_type == 'auto' and (identifier.startswith('http://') or identifier.startswith('https://'))):
+        # strip <> se vier
+        return identifier.strip().strip('<>')
+
+    # Tentativas: label -> iri search -> name (case-insensitive)
+    # 1) procura por rdfs:label (owlready fornece .label)
+    ent = ontology.search_one(label=identifier)
+    if ent:
+        return getattr(ent, 'iri', None)
+
+    # 2) procura por IRI curta ou name exata (search_one com '*name')
+    ent = ontology.search_one(iri=f"*{identifier}")
+    if ent:
+        return getattr(ent, 'iri', None)
+
+    # 3) busca case-insensitive por nome de classe/individual
+    key = identifier.lower()
+    for c in ontology.classes():
+        if getattr(c, 'name', None) and c.name.lower() == key:
+            return getattr(c, 'iri', None)
+    for ind in ontology.individuals():
+        if getattr(ind, 'name', None) and ind.name.lower() == key:
+            return getattr(ind, 'iri', None)
+
+    return None
+
+
+# --- ajuste em sparql_query_view para aceitar 'params' (opcional) ---
+# (procure sua função sparql_query_view existente e substitua/mescle pela versão abaixo)
+@csrf_exempt
+def sparql_query_view(request):
+    global onto
+    if request.method == 'POST':
+        if onto is None:
+            return JsonResponse({'status': 'error', 'message': 'Ontologia não carregada'}, status=400)
+        try:
+            data = json.loads(request.body)
+            sparql_query = data.get('query', '').strip()
+            params = data.get('params', {})  # opcional: dict de chaves -> {value, type} or raw value
+            result_format = data.get('format', 'json')
+
+            if not sparql_query:
+                return JsonResponse({'status': 'error', 'message': 'Query SPARQL é obrigatória'}, status=400)
+
+            # Se vier params, substitui placeholders {key} na query.
+            # Para cada param, se for dict com {'value':..., 'type': 'iri'|'name'|'label'}, resolves para IRI.
+            # Se for string simples, insere tal qual.
+            for k, v in params.items():
+                resolved_text = None
+                if isinstance(v, dict):
+                    val = v.get('value')
+                    id_type = v.get('type', 'auto')
+                    iri = resolve_entity_identifier(onto, val, id_type=id_type)
+                    if iri:
+                        resolved_text = f"<{iri}>"
+                    else:
+                        # se não achou, usa a string bruta entre quotes
+                        resolved_text = f"\"{val}\""
+                else:
+                    # valor simples: se parece IRI, usa <...>, caso contrário mantemos entre quotes
+                    if isinstance(v, str) and (v.startswith('http://') or v.startswith('https://') or ':' in v and '/' in v):
+                        resolved_text = f"<{v.strip().strip('<>')}>"
+                    else:
+                        resolved_text = f"\"{v}\""
+
+                sparql_query = sparql_query.replace("{" + k + "}", resolved_text)
+
+            # Execução (usa world.sparql)
+            start_time = time.time()
+            results = list(onto.world.sparql(sparql_query))
+            execution_time = time.time() - start_time
+
+            # normaliza em lista de dicts (colunas até 3 para compatibilidade UI)
+            formatted_results = []
+            for row in results:
+                formatted_results.append({
+                    'suj': str(row[0]) if len(row) > 0 else None,
+                    'pred': str(row[1]) if len(row) > 1 else None,
+                    'obj': str(row[2]) if len(row) > 2 else None
+                })
+
+            return JsonResponse({
+                'status': 'success',
+                'message': f'SPARQL executada em {execution_time:.3f}s',
+                'results': formatted_results,
+                'total': len(formatted_results),
+                'execution_time': execution_time,
+                'query': sparql_query
+            })
+
+        except Exception as e:
+            logger.error(f"Erro na SPARQL: {str(e)}", exc_info=True)
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+
+
+# --- predefined_sparql_view atualizado (aceita GET com params ou POST JSON) ---
+@csrf_exempt
+def predefined_sparql_view(request, use_case):
+    """
+    GET /api/predefined-sparql/use_case_1/?identifier=PoçoX&id_type=label
+    or POST JSON: {"identifier":"PoçoX", "id_type":"label", "measurement_class": "...", etc}
+    """
+    global onto
+
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Ontologia não carregada'}, status=400)
+
+    # extrai parâmetros (GET or POST)
+    if request.method == 'GET':
+        identifier = request.GET.get('identifier')
+        id_type = request.GET.get('id_type', 'auto')
+        measurement_class = request.GET.get('measurement_class', 'o3po:ICV_annular_pressure')
+        quality_pred = request.GET.get('quality_predicate', 'core:qualityOf')
+        component_pred = request.GET.get('component_predicate', 'o3po:component_of')
+        tag_pred = request.GET.get('tag_predicate', 'o3po:hasTag')
+        return_mode = request.GET.get('return', 'tags')
+    elif request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            identifier = data.get('identifier')
+            id_type = data.get('id_type', 'auto')
+            measurement_class = data.get('measurement_class', 'o3po:ICV_annular_pressure')
+            quality_pred = data.get('quality_predicate', 'core:qualityOf')
+            component_pred = data.get('component_predicate', 'o3po:component_of')
+            tag_pred = data.get('tag_predicate', 'o3po:hasTag')
+            return_mode = data.get('return', 'tags')
+        except Exception:
+            return JsonResponse({'status': 'error', 'message': 'JSON inválido'}, status=400)
+    else:
+        return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+
+    # helper: normalizar prefixos simples -> IRI completo (ou manter prefix:local para SPARQL)
+    def maybe_full(iri_like):
+        if not iri_like:
+            return iri_like
+        if iri_like.startswith('http://') or iri_like.startswith('https://') or iri_like.startswith('<'):
+            return iri_like.strip('<>')
+        return iri_like  # mantém prefix:local se o frontend enviar assim
+
+    # Normaliza os parâmetros ANTES de construir a query
+    measurement_class = maybe_full(measurement_class)
+    quality_pred = maybe_full(quality_pred)
+    component_pred = maybe_full(component_pred)
+    tag_pred = maybe_full(tag_pred)
+
+    # valida use_case (agora inclui use_case_3)
+    if use_case not in ['use_case_1', 'use_case_2', 'use_case_3']:
+        return JsonResponse({'status': 'error', 'message': 'Caso de uso inválido'}, status=400)
+
+    # identifier é obrigatório só para use_case_1 e use_case_2
+    if use_case in ['use_case_1', 'use_case_2'] and not identifier:
+        return JsonResponse({'status': 'error', 'message': 'Parâmetro "identifier" obrigatório para esse caso de uso'}, status=400)
+
+    # Resolve identificador somente quando necessário (use_case_1/2 ou se user pedir filtragem no use_case_3)
+    resolved_iri = None
+    target_entity = None
+    is_reservoir = False
+    is_well = False
+    if identifier:
+        resolved_iri = resolve_entity_identifier(onto, identifier, id_type=id_type)
+        if not resolved_iri and use_case in ['use_case_1', 'use_case_2']:
+            return JsonResponse({'status': 'error', 'message': 'Identificador não encontrado na ontologia'}, status=404)
+
+        # tenta detectar tipo do recurso (se for usado nas queries)
+        try:
+            target_entity = onto.search_one(iri=resolved_iri) if resolved_iri else None
+            if target_entity and hasattr(target_entity, 'is_a'):
+                for t in getattr(target_entity, 'is_a', []):
+                    name = getattr(t, 'name', '')
+                    if name and name.lower() == 'reservoir':
+                        is_reservoir = True
+                    if name and name.lower() in ('well', 'poco', 'poço'):
+                        is_well = True
+        except Exception:
+            pass
+
+    # cria cláusula de filtro para use_case_2 (só se tivermos resolved_iri)
+    filter_clause = ""
+    if use_case == 'use_case_2' and resolved_iri:
+        if is_reservoir:
+            filter_clause = f"?reservatorio = <{resolved_iri}> ."
+        elif is_well:
+            filter_clause = f"?poco = <{resolved_iri}> ."
+        else:
+            filter_clause = f"?reservatorio = <{resolved_iri}> ."
+
+    # Constrói a SPARQL parametrizada (combina use_case e return_mode)
+    if use_case == 'use_case_1':
+        if return_mode == 'tags':
+            query = f"""
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX o3po: <http://html.inf.ufrgs.br/home/pos/nosantos/public_html/o3po.owl#>
+PREFIX core: <https://purl.industrialontologies.org/ontology/core/Core/>
+SELECT DISTINCT ?tag ?icv
+WHERE {{
+  ?icv rdf:type o3po:ICV .
+  ?icv {component_pred} <{resolved_iri}> .
+  ?anular rdf:type {measurement_class} .
+  ?anular {quality_pred} ?icv .
+  ?file core:isAbout ?anular .
+  ?file {tag_pred} ?tag .
+}}
+"""
+        else:  # full
+            query = f"""
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX o3po: <http://html.inf.ufrgs.br/home/pos/nosantos/public_html/o3po.owl#>
+PREFIX core: <https://purl.industrialontologies.org/ontology/core/Core/>
+SELECT ?suj ?pred ?obj
+WHERE {{
+  ?icv rdf:type o3po:ICV .
+  ?icv {component_pred} <{resolved_iri}> .
+  ?anular rdf:type {measurement_class} .
+  ?anular {quality_pred} ?icv .
+  ?suj core:isAbout ?anular .
+  ?suj ?pred ?obj .
+}}
+"""
+    elif use_case == 'use_case_2':
+        # se return_mode=='tags' -> reduzido, senão full
+        if return_mode == 'tags':
+            query = f"""
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX o3po: <http://html.inf.ufrgs.br/home/pos/nosantos/public_html/o3po.owl#>
+PREFIX core1: <https://purl.industrialontologies.org/ontology/core/Core/>
+PREFIX core: <https://spec.industrialontologies.org/ontology/core/Core/>
+SELECT DISTINCT ?tag ?suj
+WHERE {{
+  ?reservatorio rdf:type o3po:reservoir .
+  {filter_clause}
+  ?poco rdf:type o3po:Well .
+  ?poco o3po:connected_to ?reservatorio .
+  ?icv rdf:type o3po:ICV .
+  ?icv o3po:component_of ?poco .
+  ?anular rdf:type {measurement_class} .
+  ?anular {quality_pred} ?icv .
+  ?file core1:isAbout ?anular .
+  ?file {tag_pred} ?tag .
+}}
+"""
+        else:
+            query = f"""
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX o3po: <http://html.inf.ufrgs.br/home/pos/nosantos/public_html/o3po.owl#>
+PREFIX core1: <https://purl.industrialontologies.org/ontology/core/Core/>
+PREFIX core: <https://spec.industrialontologies.org/ontology/core/Core/>
+SELECT ?suj ?pred ?obj
+WHERE {{
+  ?reservatorio rdf:type o3po:reservoir .
+  {filter_clause}
+  ?poco rdf:type o3po:Well .
+  ?poco o3po:connected_to ?reservatorio .
+  ?icv rdf:type o3po:ICV .
+  ?icv o3po:component_of ?poco .
+  ?anular rdf:type {measurement_class} .
+  ?anular {quality_pred} ?icv .
+  ?suj core1:isAbout ?anular .
+  OPTIONAL {{ ?suj ?pred ?obj }} .
+}}
+"""
+    else:  # use_case_3
+        # use_case_3 usa a SPARQL que você forneceu; identifier não é obrigatório
+        # (mas se usuario passar identifier que resolva para um FPSO, podemos filtrar — opcional)
+        try:
+            # se resolvermos identifier e o target for FPSO, adicionamos filtro para esse FPSO
+            fpsofilter = ""
+            if resolved_iri:
+                # assumimos que identifier resolve para uma IRI; filtramos por ?fpso = <IRI>
+                fpsofilter = f"?fpso = <{resolved_iri}> ."
+
+            sparql_query = f"""
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX o3po: <http://html.inf.ufrgs.br/home/pos/nosantos/public_html/o3po.owl#>
+PREFIX o3po_merged: <http://www.semanticweb.org/nicoy/ontologies/2023/1/o3po_merged#>
+PREFIX core: <https://spec.industrialontologies.org/ontology/core/Core/>
+PREFIX core1: <https://purl.industrialontologies.org/ontology/core/Core/>
+PREFIX obo: <http://purl.obolibrary.org/obo/>
+
+SELECT ?suj ?pred ?obj
+WHERE {{
+  ?poco rdf:type o3po:Well .
+  ?fpso rdf:type o3po:FPSO .
+  {fpsofilter}
+  ?poco o3po:connected_to ?fpso .
+  ?pross obo:RO_0000057 ?poco .
+  ?flow rdf:type o3po:flow_rate .
+  ?flow core:processCharacteristicOf ?pross .
+  ?suj core:isAbout ?flow .
+}}
+"""
+            results = list(onto.world.sparql(sparql_query))
+
+            formatted_results = []
+            for row in results:
+                formatted_results.append({
+                    'suj': str(row[0]) if len(row) > 0 else None,
+                    'pred': str(row[1]) if len(row) > 1 else None,
+                    'obj': str(row[2]) if len(row) > 2 else None
+                })
+
+            return JsonResponse({
+                'status': 'success',
+                'message': 'Consulta do caso de uso 3 executada com sucesso',
+                'results': formatted_results,
+                'total': len(formatted_results)
+            })
+
+        except Exception as e:
+            logger.error(f"Erro na consulta do caso de uso 3: {e}", exc_info=True)
+            return JsonResponse({
+                'status': 'error',
+                'message': f'Erro na consulta do caso de uso 3: {str(e)}'
+            }, status=500)
+
+    # Se chegamos aqui, temos uma query definida em `query` (use_case_1 ou use_case_2)
+    try:
+        start_time = time.time()
+        results = list(onto.world.sparql(query))
+        execution_time = time.time() - start_time
+
+        formatted_results = []
+        for row in results:
+            formatted_results.append({
+                'suj': str(row[0]) if len(row) > 0 else None,
+                'pred': str(row[1]) if len(row) > 1 else None,
+                'obj': str(row[2]) if len(row) > 2 else None
+            })
+
+        return JsonResponse({
+            'status': 'success',
+            'message': f'Consulta executada em {execution_time:.3f}s',
+            'results': formatted_results,
+            'total': len(formatted_results),
+            'execution_time': execution_time,
+            'query': query
+        })
+
+    except Exception as e:
+        logger.error(f"Erro ao executar SPARQL: {e}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
+
+@csrf_exempt
+def query_builder_helper_view(request):
+    """
+    Helper para construção de queries DL
+    
+    GET /api/query-builder-helper/
+    """
+    global onto
+    
+    if request.method != 'GET':
+        return JsonResponse({'status': 'error', 'message': 'Método não permitido'}, status=405)
+    
+    if onto is None:
+        return JsonResponse({'status': 'error', 'message': 'Ontologia não carregada'}, status=400)
+    
+    try:
+        engine = EnhancedDLQueryEngine(onto)
+        constructs = engine.get_available_constructs()
+        
+        # Adiciona informações sobre hierarquia de classes
+        class_hierarchy = {}
+        for cls in onto.classes():
+            if cls.name:
+                parents = [parent.name for parent in cls.is_a if hasattr(parent, 'name')]
+                subclasses = [sub.name for sub in cls.subclasses() if sub.name]
+                class_hierarchy[cls.name] = {
+                    'parents': parents,
+                    'subclasses': subclasses
+                }
+        
+        # Informações sobre propriedades
+        property_info = {}
+        for prop in list(onto.object_properties()) + list(onto.data_properties()):
+            if prop.name:
+                property_info[prop.name] = {
+                    'type': 'object' if hasattr(prop, 'range') and any(hasattr(r, 'name') for r in getattr(prop, 'range', [])) else 'data',
+                    'domain': [d.name for d in getattr(prop, 'domain', []) if hasattr(d, 'name')],
+                    'range': [r.name for r in getattr(prop, 'range', []) if hasattr(r, 'name')],
+                    'functional': hasattr(prop, 'is_functional') and prop.is_functional
+                }
+        
+        return JsonResponse({
+            'status': 'success',
+            'constructs': constructs,
+            'available_constructs': constructs,
+            'class_hierarchy': class_hierarchy,
+            'property_info': property_info,
+            'syntax_help': {
+                'operators': {
+                    'and': 'Intersecção de classes (A and B)',
+                    'or': 'União de classes (A or B)', 
+                    'not': 'Negação (not A)',
+                    'some': 'Restrição existencial (property some Class)',
+                    'only': 'Restrição universal (property only Class)',
+                    'value': 'Restrição de valor (property value individual)',
+                    'min': 'Cardinalidade mínima (property min 2 Class)',
+                    'max': 'Cardinalidade máxima (property max 5 Class)',
+                    'exactly': 'Cardinalidade exata (property exactly 1 Class)'
+                },
+                'examples': [
+                    'Person',
+                    'Person and hasAge some Integer',
+                    'Vehicle or (hasEngine some Engine)',
+                    'not EmptyClass',
+                    'hasChild min 2 Person',
+                    'owns exactly 1 Car'
+                ]
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Erro no query builder helper: {e}", exc_info=True)
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500) 

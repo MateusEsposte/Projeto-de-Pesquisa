@@ -1,0 +1,32 @@
+# requirements.txt para integração com HermiT
+
+# Core Django e OWL
+Django>=4.0.0
+owlready2>=0.41
+
+# Reasoners
+# HermiT (via JPype1 para integração Java)
+JPype1>=1.4.0
+
+# Pellet (alternativo)
+# Note: Pellet requer configuração adicional do Java
+
+# Cache e Performance
+redis>=4.0.0  # Para cache distribuído (opcional)
+django-redis>=5.0.0  # Cache backend para Django
+
+# Logging e Monitoring
+structlog>=22.0.0
+django-extensions>=3.0.0
+
+# Utilitários
+python-dotenv>=0.19.0
+requests>=2.28.0
+
+# Testes (opcional)
+pytest>=7.0.0
+pytest-django>=4.5.0
+
+# Documentação da API (opcional)
+djangorestframework>=3.14.0
+drf-spectacular>=0.25.0
