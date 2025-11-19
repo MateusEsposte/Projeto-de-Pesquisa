@@ -1,0 +1,323 @@
+/* productionloss.css - Versão Offshore */
+.production-loss-container {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: #0a1931; /* Azul marinho escuro */
+  min-height: 100vh;
+  color: #ffffff;
+}
+
+.header {
+  background: rgba(30, 39, 54, 0.95); /* Cinza industrial */
+  backdrop-filter: blur(10px);
+  padding: 20px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  border-bottom: 3px solid #f8b500; /* Azul aço */
+}
+
+.header h1 {
+  color: #ffffff;
+  font-size: 24px;
+  margin-bottom: 10px;
+}
+
+.header .subtitle {
+  color: #a0aec0; /* Cinza claro */
+  font-size: 14px;
+}
+
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  gap: 20px;
+  min-height: calc(100vh - 120px);
+}
+
+.sidebar {
+  background: rgba(30, 39, 54, 0.95); /* Cinza industrial */
+  backdrop-filter: blur(10px);
+  border-radius: 15px;
+  padding: 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  border: 1px solid #2d3748;
+  height: fit-content;
+}
+
+.main-content {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 20px;
+}
+
+.query-section {
+  background: rgba(30, 39, 54, 0.95); /* Cinza industrial */
+  backdrop-filter: blur(10px);
+  border-radius: 15px;
+  padding: 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  border: 1px solid #2d3748;
+}
+
+.visualization-area {
+  background: rgba(30, 39, 54, 0.95); /* Cinza industrial */
+  backdrop-filter: blur(10px);
+  border-radius: 15px;
+  padding: 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  border: 1px solid #2d3748;
+}
+
+.section-title {
+  font-size: 18px;
+  color: #ffffff;
+  margin-bottom: 15px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid #2d3748;
+}
+
+.well-selector {
+  margin-bottom: 20px;
+}
+
+.well-selector select {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #2d3748;
+  border-radius: 8px;
+  font-size: 14px;
+  background: #1a202c;
+  color: #ffffff;
+  transition: all 0.3s ease;
+}
+
+.well-selector select:focus {
+  outline: none;
+  border-color: #dbaa18;
+  box-shadow: 0 0 0 3px rgba(24, 90, 219, 0.1);
+}
+
+.icv-list {
+  margin-bottom: 20px;
+}
+
+.icv-item {
+  display: flex;
+  align-items: center;
+  padding: 10px;
+  margin: 8px 0;
+  background: #1a202c;
+  border-radius: 8px;
+  border-left: 4px solid #dbaa18;
+  transition: all 0.3s ease;
+}
+
+.icv-item:hover {
+  background: #2d3748;
+  transform: translateX(5px);
+}
+
+.icv-checkbox {
+  margin-right: 10px;
+  transform: scale(1.2);
+}
+
+.icv-info {
+  flex: 1;
+  font-size: 12px;
+}
+
+.icv-name {
+  font-weight: bold;
+  color: #ffffff;
+}
+
+.icv-status {
+  color: #a0aec0;
+  margin-top: 2px;
+}
+
+.status-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 5px;
+}
+
+.status-ok { background: #00b894; } /* Verde operacional */
+.status-warning { background: #f8b500; } /* Laranja de segurança */
+.status-error { background: #e53e3e; } /* Vermelho para erro */
+
+.query-input {
+  margin-bottom: 15px;
+}
+
+.query-input textarea {
+  width: 100%;
+  height: 80px;
+  padding: 12px;
+  border: 2px solid #2d3748;
+  border-radius: 8px;
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+  resize: vertical;
+  transition: all 0.3s ease;
+  background: #1a202c;
+  color: #ffffff;
+}
+
+.query-input textarea:focus {
+  outline: none;
+  border-color: #185adb;
+  box-shadow: 0 0 0 3px rgba(24, 90, 219, 0.1);
+}
+
+.query-results {
+  background: #1a202c;
+  border: 1px solid #2d3748;
+  border-radius: 8px;
+  padding: 15px;
+  margin-top: 10px;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  color: #ffffff;
+}
+
+.btn {
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  transition: all 0.3s ease;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #f8b500, #e6a000); /* Laranja de segurança */
+  color: #0a1931;
+  margin-right: 10px;
+}
+
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(248, 181, 0, 0.4);
+}
+
+.btn-secondary {
+  background: linear-gradient(135deg, #ffe101, #b8a300); /* Verde operacional */
+  color: white;
+}
+
+.btn-secondary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(0, 184, 148, 0.4);
+}
+
+.chart-container {
+  background: #1a202c;
+  border-radius: 12px;
+  padding: 20px;
+  margin-top: 20px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+  height: 400px;
+  border: 1px solid #2d3748;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 15px;
+  margin-bottom: 20px;
+}
+
+.metric-card {
+  background: linear-gradient(135deg, #0a1931, #d69d00); 
+  color: white;
+  padding: 20px;
+  border-radius: 12px;
+  text-align: center;
+  box-shadow: 0 4px 15px rgba(219, 183, 24, 0.3);
+  transition: all 0.3s ease;
+}
+
+.metric-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 4px 15px rgba(219, 183, 24, 0.3);
+}
+
+.metric-value {
+  font-size: 24px;
+  font-weight: bold;
+  margin-bottom: 5px;
+}
+
+.metric-label {
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+.analysis-panel {
+  background: #1a202c;
+  border-left: 4px solid #dbb418;
+  padding: 15px;
+  border-radius: 8px;
+  margin-top: 20px;
+}
+
+.analysis-title {
+  font-weight: bold;
+  color: #ffffff;
+  margin-bottom: 10px;
+}
+
+.analysis-item {
+  padding: 8px 0;
+  border-bottom: 1px solid #2d3748;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: #a0aec0;
+}
+
+.analysis-item:last-child {
+  border-bottom: none;
+}
+
+.time-range {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.time-range input {
+  padding: 8px;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  font-size: 12px;
+  background: #1a202c;
+  color: #ffffff;
+}
+
+.alert {
+  padding: 12px;
+  border-radius: 8px;
+  margin: 10px 0;
+  font-size: 14px;
+}
+
+.alert-warning {
+  background: rgba(248, 181, 0, 0.1);
+  border-left: 4px solid #f8b500;
+  color: #f8b500;
+}
+
+.alert-info {
+  background: rgba(24, 90, 219, 0.1);
+  border-left: 4px solid #dba118;
+  color: #a0aec0;
+}
